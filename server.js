@@ -244,6 +244,148 @@ app.post("/send-phone-otp", async (req, res) => {
   }
 });
 
+app.post("/send-phone-reset-otp", async (req, res) => {
+  try {
+    const phoneRaw = typeof req.body?.phone === "string" ? req.body.phone : "";
+    const kr = normalizeKoreanMobile(phoneRaw);
+
+    if (!kr.ok) {
+      return bad(res, 400, kr.reason);
+    }
+
+    const normalized = kr.phone;
+
+    // 재설정은 이미 인증된 번호만 가능
+    const { data: owner, error: ownerErr } = await supabase
+      .from("profiles")
+      .select("id, phone_verified")
+      .eq("phone_number", normalized)
+      .eq("phone_verified", true)
+      .maybeSingle();
+
+    if (ownerErr) throw ownerErr;
+
+    if (!owner?.id) {
+      return bad(res, 404, "가입된 전화번호를 찾을 수 없습니다.", {
+        code: "PHONE_NOT_FOUND",
+      });
+    }
+
+    const { data: existing, error: existingErr } = await supabase
+      .from("phone_reset_verifications")
+      .select("last_sent_at, send_count")
+      .eq("phone_e164", normalized)
+      .maybeSingle();
+
+    if (existingErr) throw existingErr;
+
+    const now = new Date();
+
+    if (existing?.last_sent_at) {
+      const lastSentAt = new Date(existing.last_sent_at);
+      const diff = now.getTime() - lastSentAt.getTime();
+
+      if (diff < COOLDOWN_MS) {
+        return bad(res, 429, "잠시 후 다시 시도해 주세요.", {
+          cooldown_seconds: Math.ceil((COOLDOWN_MS - diff) / 1000),
+        });
+      }
+    }
+
+    const lastSentDate = existing?.last_sent_at
+      ? new Date(existing.last_sent_at)
+      : null;
+
+    const nextSendCount =
+      lastSentDate && isSameLocalDay(lastSentDate, now)
+        ? Number(existing?.send_count ?? 0) + 1
+        : 1;
+
+    if (nextSendCount > MAX_SENDS_PER_DAY) {
+      return bad(res, 429, "오늘 인증 요청 횟수를 초과했습니다.");
+    }
+
+    const otp = genOtp6();
+    const codeHash = sha256Hex(`${normalized}:${otp}:${OTP_PEPPER}`);
+    const expiresAt = new Date(Date.now() + OTP_EXPIRE_MS).toISOString();
+
+    const { error: upsertErr } = await supabase
+      .from("phone_reset_verifications")
+      .upsert(
+        {
+          phone_e164: normalized,
+          code_hash: codeHash,
+          expires_at: expiresAt,
+          attempt_count: 0,
+          send_count: nextSendCount,
+          last_sent_at: now.toISOString(),
+          verified_at: null,
+        },
+        { onConflict: "phone_e164" },
+      );
+
+    if (upsertErr) throw upsertErr;
+
+    if (SMS_DEV_MODE) {
+      console.log("[DEV RESET OTP]", normalized, otp);
+      return res.status(200).json({
+        success: true,
+        cooldown_seconds: Math.ceil(COOLDOWN_MS / 1000),
+        dev_mode: true,
+        dev_otp: otp,
+      });
+    }
+
+    if (!ALIGO_API_KEY || !ALIGO_USER_ID || !ALIGO_SENDER) {
+      return bad(res, 500, "SMS 발송 환경설정이 누락되었습니다.");
+    }
+
+    const formData = new URLSearchParams();
+    formData.append("key", ALIGO_API_KEY);
+    formData.append("user_id", ALIGO_USER_ID);
+    formData.append("sender", ALIGO_SENDER);
+    formData.append("receiver", normalized);
+    formData.append("msg", `[수리야] PIN 재설정 인증번호는 ${otp} 입니다.`);
+    if (ALIGO_TEST_MODE) {
+      formData.append("testmode_yn", "Y");
+    }
+
+    const aligoRes = await fetch("https://apis.aligo.in/send/", {
+      method: "POST",
+      body: formData,
+    });
+
+    const text = await aligoRes.text();
+    let payload = {};
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { raw: text };
+    }
+
+    const resultCode = String(payload?.result_code ?? "");
+    const success =
+      aligoRes.ok &&
+      (resultCode === "1" ||
+        resultCode === "success" ||
+        payload?.success === true);
+
+    if (!success) {
+      console.error("[ALIGO] reset send failed:", payload);
+      return bad(res, 502, "인증번호 전송에 실패했어요.", {
+        vendor: payload,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      cooldown_seconds: Math.ceil(COOLDOWN_MS / 1000),
+    });
+  } catch (err) {
+    console.error("[send-phone-reset-otp] error:", err);
+    return bad(res, 500, "서버 오류가 발생했어요.");
+  }
+});
 app.post("/verify-phone-otp", async (req, res) => {
   try {
     const phoneRaw = typeof req.body?.phone === "string" ? req.body.phone : "";
