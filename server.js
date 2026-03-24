@@ -345,7 +345,7 @@ app.post("/send-phone-reset-otp", async (req, res) => {
     formData.append("user_id", ALIGO_USER_ID);
     formData.append("sender", ALIGO_SENDER);
     formData.append("receiver", normalized);
-    formData.append("msg", `[수리야] PIN 재설정 인증번호는 ${otp} 입니다.`);
+    formData.append("msg", `[수리야] 비밀번호 재설정 인증번호는 ${otp} 입니다.`);
     if (ALIGO_TEST_MODE) {
       formData.append("testmode_yn", "Y");
     }
