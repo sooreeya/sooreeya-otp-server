@@ -15,7 +15,19 @@ const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const OTP_PEPPER = process.env.OTP_PEPPER || "";
 
-const SMS_DEV_MODE = String(process.env.SMS_DEV_MODE || "true") === "true";
+const NODE_ENV = String(process.env.NODE_ENV || "production")
+  .trim()
+  .toLowerCase();
+const SMS_DEV_MODE_REQUESTED =
+  String(process.env.SMS_DEV_MODE || "false").trim().toLowerCase() === "true";
+const ALLOW_DEV_OTP_RESPONSE =
+  String(process.env.ALLOW_DEV_OTP_RESPONSE || "false")
+    .trim()
+    .toLowerCase() === "true";
+const SMS_DEV_MODE =
+  NODE_ENV === "development" &&
+  SMS_DEV_MODE_REQUESTED &&
+  ALLOW_DEV_OTP_RESPONSE;
 const ALIGO_TEST_MODE =
   String(process.env.ALIGO_TEST_MODE || "false") === "true";
 
@@ -31,6 +43,12 @@ const MAX_SENDS_PER_DAY = 10;
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !OTP_PEPPER) {
   console.error("[BOOT] Missing required env");
   process.exit(1);
+}
+
+if (SMS_DEV_MODE_REQUESTED && !SMS_DEV_MODE) {
+  console.warn(
+    "[BOOT] SMS dev mode request ignored outside explicitly allowed development mode",
+  );
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
