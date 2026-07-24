@@ -6,6 +6,8 @@ import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 
+// Railway terminates HTTPS one proxy hop before the application.
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
@@ -39,6 +41,11 @@ const OTP_EXPIRE_MS = 5 * 60 * 1000;
 const COOLDOWN_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const MAX_SENDS_PER_DAY = 10;
+const IP_MINUTE_WINDOW_MS = 60 * 1000;
+const IP_HOUR_WINDOW_MS = 60 * 60 * 1000;
+const MAX_SEND_REQUESTS_PER_IP_MINUTE = 5;
+const MAX_SEND_REQUESTS_PER_IP_HOUR = 30;
+const ipSendRequestBuckets = new Map();
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !OTP_PEPPER) {
   console.error("[BOOT] Missing required env");
@@ -108,6 +115,77 @@ function bad(res, status, message, extra = {}) {
   });
 }
 
+function getClientIp(req) {
+  return String(req.ip || req.socket?.remoteAddress || "unknown")
+    .trim()
+    .replace(/^::ffff:/, "");
+}
+
+function checkAndRecordIpSendRequest(ip, nowMs = Date.now()) {
+  const current = ipSendRequestBuckets.get(ip) || {
+    minuteStartedAt: nowMs,
+    minuteCount: 0,
+    hourStartedAt: nowMs,
+    hourCount: 0,
+  };
+
+  if (nowMs - current.minuteStartedAt >= IP_MINUTE_WINDOW_MS) {
+    current.minuteStartedAt = nowMs;
+    current.minuteCount = 0;
+  }
+
+  if (nowMs - current.hourStartedAt >= IP_HOUR_WINDOW_MS) {
+    current.hourStartedAt = nowMs;
+    current.hourCount = 0;
+  }
+
+  const minuteBlocked =
+    current.minuteCount >= MAX_SEND_REQUESTS_PER_IP_MINUTE;
+  const hourBlocked = current.hourCount >= MAX_SEND_REQUESTS_PER_IP_HOUR;
+
+  if (minuteBlocked || hourBlocked) {
+    const retryAfterMs = hourBlocked
+      ? IP_HOUR_WINDOW_MS - (nowMs - current.hourStartedAt)
+      : IP_MINUTE_WINDOW_MS - (nowMs - current.minuteStartedAt);
+
+    ipSendRequestBuckets.set(ip, current);
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)),
+    };
+  }
+
+  current.minuteCount += 1;
+  current.hourCount += 1;
+  ipSendRequestBuckets.set(ip, current);
+
+  return { allowed: true, retryAfterSeconds: 0 };
+}
+
+function limitOtpSendRequestsByIp(req, res, next) {
+  const result = checkAndRecordIpSendRequest(getClientIp(req));
+
+  if (!result.allowed) {
+    res.set("Retry-After", String(result.retryAfterSeconds));
+    return bad(res, 429, "요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.", {
+      retry_after_seconds: result.retryAfterSeconds,
+    });
+  }
+
+  return next();
+}
+
+const ipBucketCleanupTimer = setInterval(() => {
+  const cutoff = Date.now() - IP_HOUR_WINDOW_MS;
+
+  for (const [ip, bucket] of ipSendRequestBuckets.entries()) {
+    if (bucket.hourStartedAt < cutoff) {
+      ipSendRequestBuckets.delete(ip);
+    }
+  }
+}, IP_HOUR_WINDOW_MS);
+ipBucketCleanupTimer.unref();
+
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -116,7 +194,7 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.post("/send-phone-otp", async (req, res) => {
+app.post("/send-phone-otp", limitOtpSendRequestsByIp, async (req, res) => {
   try {
     const phoneRaw = typeof req.body?.phone === "string" ? req.body.phone : "";
     const kr = normalizeKoreanMobile(phoneRaw);
@@ -271,7 +349,7 @@ app.post("/send-phone-otp", async (req, res) => {
   }
 });
 
-app.post("/send-phone-reset-otp", async (req, res) => {
+app.post("/send-phone-reset-otp", limitOtpSendRequestsByIp, async (req, res) => {
   try {
     const phoneRaw = typeof req.body?.phone === "string" ? req.body.phone : "";
     const kr = normalizeKoreanMobile(phoneRaw);
