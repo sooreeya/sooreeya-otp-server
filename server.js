@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
+import net from "node:net";
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
@@ -116,6 +117,15 @@ function bad(res, status, message, extra = {}) {
 }
 
 function getClientIp(req) {
+  const railwayClientIp =
+    typeof req.get("x-real-ip") === "string"
+      ? req.get("x-real-ip").trim().replace(/^::ffff:/, "")
+      : "";
+
+  if (net.isIP(railwayClientIp)) {
+    return railwayClientIp;
+  }
+
   return String(req.ip || req.socket?.remoteAddress || "unknown")
     .trim()
     .replace(/^::ffff:/, "");
