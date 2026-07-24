@@ -68,6 +68,13 @@ function sha256Hex(input) {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
+function safeErrorCode(error) {
+  if (!error || typeof error !== "object") return "unknown";
+  return typeof error.code === "string" && error.code
+    ? error.code
+    : "unknown";
+}
+
 function isSameLocalDay(a, b) {
   return (
     a.getFullYear() === b.getFullYear() &&
@@ -183,7 +190,6 @@ app.post("/send-phone-otp", async (req, res) => {
 
     if (SMS_DEV_MODE) {
       console.log("[DEV] SMS skipped");
-      console.log("[DEV OTP]", normalized, otp);
 
       return res.status(200).json({
         success: true,
@@ -228,10 +234,11 @@ app.post("/send-phone-otp", async (req, res) => {
         payload?.success === true);
 
     if (!success) {
-      console.error("[ALIGO] send failed:", payload);
-      return bad(res, 502, "인증번호 전송에 실패했어요.", {
-        vendor: payload,
+      console.error("[ALIGO] send failed", {
+        httpStatus: aligoRes.status,
+        resultCode: resultCode || "unknown",
       });
+      return bad(res, 502, "인증번호 전송에 실패했어요.");
     }
 
     return res.status(200).json({
@@ -239,7 +246,9 @@ app.post("/send-phone-otp", async (req, res) => {
       cooldown_seconds: Math.ceil(COOLDOWN_MS / 1000),
     });
   } catch (err) {
-    console.error("[send-phone-otp] error:", err);
+    console.error("[send-phone-otp] failed", {
+      code: safeErrorCode(err),
+    });
     return bad(res, 500, "서버 오류가 발생했어요.");
   }
 });
@@ -327,7 +336,7 @@ app.post("/send-phone-reset-otp", async (req, res) => {
     if (upsertErr) throw upsertErr;
 
     if (SMS_DEV_MODE) {
-      console.log("[DEV RESET OTP]", normalized, otp);
+      console.log("[DEV] Reset SMS skipped");
       return res.status(200).json({
         success: true,
         cooldown_seconds: Math.ceil(COOLDOWN_MS / 1000),
@@ -371,10 +380,11 @@ app.post("/send-phone-reset-otp", async (req, res) => {
         payload?.success === true);
 
     if (!success) {
-      console.error("[ALIGO] reset send failed:", payload);
-      return bad(res, 502, "인증번호 전송에 실패했어요.", {
-        vendor: payload,
+      console.error("[ALIGO] reset send failed", {
+        httpStatus: aligoRes.status,
+        resultCode: resultCode || "unknown",
       });
+      return bad(res, 502, "인증번호 전송에 실패했어요.");
     }
 
     return res.status(200).json({
@@ -382,7 +392,9 @@ app.post("/send-phone-reset-otp", async (req, res) => {
       cooldown_seconds: Math.ceil(COOLDOWN_MS / 1000),
     });
   } catch (err) {
-    console.error("[send-phone-reset-otp] error:", err);
+    console.error("[send-phone-reset-otp] failed", {
+      code: safeErrorCode(err),
+    });
     return bad(res, 500, "서버 오류가 발생했어요.");
   }
 });
@@ -482,7 +494,9 @@ app.post("/verify-phone-otp", async (req, res) => {
       phone_verified: true,
     });
   } catch (err) {
-    console.error("[verify-phone-otp] error:", err);
+    console.error("[verify-phone-otp] failed", {
+      code: safeErrorCode(err),
+    });
     return bad(res, 500, "서버 오류가 발생했어요.");
   }
 });
