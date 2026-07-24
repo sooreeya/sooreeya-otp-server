@@ -41,7 +41,6 @@ const ALIGO_SENDER = process.env.ALIGO_SENDER || "";
 const OTP_EXPIRE_MS = 5 * 60 * 1000;
 const COOLDOWN_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
-const MAX_SENDS_PER_DAY = 10;
 const IP_MINUTE_WINDOW_MS = 60 * 1000;
 const IP_HOUR_WINDOW_MS = 60 * 60 * 1000;
 const MAX_SEND_REQUESTS_PER_IP_MINUTE = 5;
@@ -101,19 +100,43 @@ function safeErrorCode(error) {
     : "unknown";
 }
 
-function isSameLocalDay(a, b) {
-  return (
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate()
-  );
-}
-
 function bad(res, status, message, extra = {}) {
   return res.status(status).json({
     error: message,
     ...extra,
   });
+}
+
+async function reserveOtpSend(
+  functionName,
+  phoneE164,
+  codeHash,
+  expiresAt,
+) {
+  const { data, error } = await supabase.rpc(functionName, {
+    p_phone_e164: phoneE164,
+    p_code_hash: codeHash,
+    p_expires_at: expiresAt,
+  });
+
+  if (error) throw error;
+
+  const result = Array.isArray(data) ? data[0] : data;
+  const status = typeof result?.status === "string" ? result.status : "";
+  const retryAfterSeconds = Number(result?.retry_after_seconds ?? 0);
+
+  if (!["allowed", "cooldown", "daily_limit"].includes(status)) {
+    const invalidResultError = new Error("Invalid OTP reservation result");
+    invalidResultError.code = "INVALID_OTP_RESERVATION_RESULT";
+    throw invalidResultError;
+  }
+
+  return {
+    status,
+    retryAfterSeconds: Number.isFinite(retryAfterSeconds)
+      ? Math.max(0, Math.ceil(retryAfterSeconds))
+      : 0,
+  };
 }
 
 function getClientIp(req) {
@@ -232,67 +255,31 @@ app.post("/send-phone-otp", limitOtpSendRequestsByIp, async (req, res) => {
       });
     }
 
-    const { data: existing, error: existingErr } = await supabase
-      .from("phone_verifications")
-      .select("last_sent_at, send_count")
-      .eq("phone_e164", normalized)
-      .maybeSingle();
-
-    if (existingErr) throw existingErr;
-
-    const now = new Date();
-
-    if (existing?.last_sent_at) {
-      const lastSentAt = new Date(existing.last_sent_at);
-      const diff = now.getTime() - lastSentAt.getTime();
-
-      if (diff < COOLDOWN_MS) {
-        return bad(
-          res,
-          429,
-          `잠시 후 다시 시도해 주세요. (${Math.ceil(
-            (COOLDOWN_MS - diff) / 1000,
-          )}초 남음)`,
-          {
-            cooldown_seconds: Math.ceil((COOLDOWN_MS - diff) / 1000),
-          },
-        );
-      }
-    }
-
-    const lastSentDate = existing?.last_sent_at
-      ? new Date(existing.last_sent_at)
-      : null;
-
-    const nextSendCount =
-      lastSentDate && isSameLocalDay(lastSentDate, now)
-        ? Number(existing?.send_count ?? 0) + 1
-        : 1;
-
-    if (nextSendCount > MAX_SENDS_PER_DAY) {
-      return bad(res, 429, "오늘 인증 요청 횟수를 초과했습니다.");
-    }
-
     const otp = genOtp6();
     const codeHash = sha256Hex(`${normalized}:${otp}:${OTP_PEPPER}`);
     const expiresAt = new Date(Date.now() + OTP_EXPIRE_MS).toISOString();
 
-    const { error: upsertErr } = await supabase
-      .from("phone_verifications")
-      .upsert(
-        {
-          phone_e164: normalized,
-          code_hash: codeHash,
-          expires_at: expiresAt,
-          attempt_count: 0,
-          send_count: nextSendCount,
-          last_sent_at: now.toISOString(),
-          verified_at: null,
-        },
-        { onConflict: "phone_e164" },
-      );
+    const reservation = await reserveOtpSend(
+      "reserve_phone_verification_send",
+      normalized,
+      codeHash,
+      expiresAt,
+    );
 
-    if (upsertErr) throw upsertErr;
+    if (reservation.status === "cooldown") {
+      return bad(
+        res,
+        429,
+        `잠시 후 다시 시도해 주세요. (${reservation.retryAfterSeconds}초 남음)`,
+        { cooldown_seconds: reservation.retryAfterSeconds },
+      );
+    }
+
+    if (reservation.status === "daily_limit") {
+      return bad(res, 429, "오늘 인증 요청 횟수를 초과했습니다.", {
+        retry_after_seconds: reservation.retryAfterSeconds,
+      });
+    }
 
     if (SMS_DEV_MODE) {
       console.log("[DEV] SMS skipped");
@@ -386,60 +373,28 @@ app.post("/send-phone-reset-otp", limitOtpSendRequestsByIp, async (req, res) => 
       });
     }
 
-    const { data: existing, error: existingErr } = await supabase
-      .from("phone_reset_verifications")
-      .select("last_sent_at, send_count")
-      .eq("phone_e164", normalized)
-      .maybeSingle();
-
-    if (existingErr) throw existingErr;
-
-    const now = new Date();
-
-    if (existing?.last_sent_at) {
-      const lastSentAt = new Date(existing.last_sent_at);
-      const diff = now.getTime() - lastSentAt.getTime();
-
-      if (diff < COOLDOWN_MS) {
-        return bad(res, 429, "잠시 후 다시 시도해 주세요.", {
-          cooldown_seconds: Math.ceil((COOLDOWN_MS - diff) / 1000),
-        });
-      }
-    }
-
-    const lastSentDate = existing?.last_sent_at
-      ? new Date(existing.last_sent_at)
-      : null;
-
-    const nextSendCount =
-      lastSentDate && isSameLocalDay(lastSentDate, now)
-        ? Number(existing?.send_count ?? 0) + 1
-        : 1;
-
-    if (nextSendCount > MAX_SENDS_PER_DAY) {
-      return bad(res, 429, "오늘 인증 요청 횟수를 초과했습니다.");
-    }
-
     const otp = genOtp6();
     const codeHash = sha256Hex(`${normalized}:${otp}:${OTP_PEPPER}`);
     const expiresAt = new Date(Date.now() + OTP_EXPIRE_MS).toISOString();
 
-    const { error: upsertErr } = await supabase
-      .from("phone_reset_verifications")
-      .upsert(
-        {
-          phone_e164: normalized,
-          code_hash: codeHash,
-          expires_at: expiresAt,
-          attempt_count: 0,
-          send_count: nextSendCount,
-          last_sent_at: now.toISOString(),
-          verified_at: null,
-        },
-        { onConflict: "phone_e164" },
-      );
+    const reservation = await reserveOtpSend(
+      "reserve_phone_reset_verification_send",
+      normalized,
+      codeHash,
+      expiresAt,
+    );
 
-    if (upsertErr) throw upsertErr;
+    if (reservation.status === "cooldown") {
+      return bad(res, 429, "잠시 후 다시 시도해 주세요.", {
+        cooldown_seconds: reservation.retryAfterSeconds,
+      });
+    }
+
+    if (reservation.status === "daily_limit") {
+      return bad(res, 429, "오늘 인증 요청 횟수를 초과했습니다.", {
+        retry_after_seconds: reservation.retryAfterSeconds,
+      });
+    }
 
     if (SMS_DEV_MODE) {
       console.log("[DEV] Reset SMS skipped");
